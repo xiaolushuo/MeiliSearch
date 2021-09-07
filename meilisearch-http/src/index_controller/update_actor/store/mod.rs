@@ -1,27 +1,23 @@
 mod codec;
 pub mod dump;
 
+use std::collections::VecDeque;
 use std::fs::{copy, create_dir_all, remove_file, File};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::{
     collections::{BTreeMap, HashSet},
     path::PathBuf,
-    time::Duration,
 };
 
-use arc_swap::ArcSwap;
 use futures::StreamExt;
-use heed::types::{ByteSlice, OwnedType, SerdeJson};
+use heed::types::{ByteSlice, OwnedType, SerdeJson, Unit};
 use heed::zerocopy::U64;
 use heed::{CompactionOption, Database, Env, EnvOpenOptions};
-use log::error;
-use parking_lot::{Mutex, MutexGuard};
+use tokio::select;
 use tokio::runtime::Handle;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::time::timeout;
 use uuid::Uuid;
 
 use codec::*;
@@ -33,6 +29,8 @@ use crate::index_controller::{index_actor::CONCURRENT_INDEX_MSG, updates::*, Ind
 
 #[allow(clippy::upper_case_acronyms)]
 type BEU64 = U64<heed::byteorder::BE>;
+type UpdateId = u64;
+type GlobalUpdateId = u64;
 
 const UPDATE_DIR: &str = "update_files";
 
@@ -44,50 +42,223 @@ pub struct UpdateStoreInfo {
 }
 
 /// A data structure that allows concurrent reads AND exactly one writer.
-pub struct StateLock {
-    lock: Mutex<()>,
-    data: ArcSwap<State>,
-}
-
-pub struct StateLockGuard<'a> {
-    _lock: MutexGuard<'a, ()>,
-    state: &'a StateLock,
-}
-
-impl StateLockGuard<'_> {
-    pub fn swap(&self, state: State) -> Arc<State> {
-        self.state.data.swap(Arc::new(state))
-    }
-}
-
-impl StateLock {
-    fn from_state(state: State) -> Self {
-        let lock = Mutex::new(());
-        let data = ArcSwap::from(Arc::new(state));
-        Self { lock, data }
-    }
-
-    pub fn read(&self) -> Arc<State> {
-        self.data.load().clone()
-    }
-
-    pub fn write(&self) -> StateLockGuard {
-        let _lock = self.lock.lock();
-        let state = &self;
-        StateLockGuard { _lock, state }
-    }
-}
-
 #[allow(clippy::large_enum_variant)]
-pub enum State {
+pub enum Status {
     Idle,
     Processing(Uuid, Processing),
     Snapshoting,
     Dumping,
 }
 
+#[derive(Debug)]
+enum Task {
+    DeleteIndex {
+        ret: oneshot::Sender<()>,
+        uuid: Uuid,
+    },
+    Update {
+        processing: Processing,
+        index_uuid: Uuid,
+    },
+    Snapshot,
+    Dump,
+}
+
+enum SnapshotRequest {
+    Dump,
+    Snapshot,
+}
+
+pub type UpdateReceiver = mpsc::Receiver<(Uuid, UpdateMeta, Option<Uuid>, oneshot::Sender<Result<Enqueued>>)>;
+
+/// The write queue is used to serialize write to the update store, and ensure the consistency of
+/// the database.
+pub struct WriteQueue {
+    task_receiver: mpsc::Receiver<Task>,
+    /// index uuid, update metadata, content
+    update_receiver: UpdateReceiver,
+    worker_receiver: mpsc::Receiver<WorkerMsg>,
+    store: Arc<UpdateStore<RW>>,
+    update_queue: VecDeque<UpdateId>,
+    pending_update: usize,
+    status: Status,
+}
+
+impl WriteQueue {
+    pub fn new<I: IndexActorHandle + Sync + Send + 'static>(
+        store: Arc<UpdateStore<RW>>,
+        task_receiver: mpsc::Receiver<Task>,
+        update_receiver: UpdateReceiver,
+        indexes: I,
+        ) -> Self {
+        // TODO: Load the updates in the update store
+        let (worker_sender, worker_receiver) = mpsc::channel(100);
+        let worker = UpdateWorker::new(&store.path, worker_sender, indexes);
+        tokio::spawn(worker.run());
+
+        Self {
+            task_receiver,
+            update_receiver,
+            worker_receiver,
+            store,
+            update_queue: VecDeque::new(),
+            pending_update: 0,
+            status: Status::Idle,
+        }
+    }
+
+    /// Run the WriteQueue loop.
+    ///
+    /// The write queue acts as a scheduler for operation that need to be performed on the update
+    /// store. It schedule write operation one at a time.
+    ///
+    /// The highest priority task is to get a job slot from the worker. Whenever the worker is
+    /// ready for more work, it poll the WriteQueue and hands it channed where the WriteQueue can
+    /// send a task.
+    ///
+    /// We then look for Snapshot, Dump, or index deletion tasks, since we want to run then ASAP,
+    /// before any other update.
+    ///
+    /// We then look at if we have received any update registration request, if it is the case, we
+    /// register it, and push it on the update queue,
+    ///
+    /// If we have nothing else to do, then we pop our update queue, and process the update.
+    async fn run(mut self) {
+        let mut task_sender = None;
+        loop {
+            select! {
+                biased;
+
+                Some(msg) = self.worker_receiver.recv() => {
+                    match msg {
+                        WorkerMsg::Ready(snd) => { task_sender.replace(snd); },
+                        WorkerMsg::Processed(result, ret) => {
+                            self.store.process(result).await.expect("Could not write update result disk.");
+                            // Signal to the worker that the update was written correctly to the store.
+                            ret.send(()).expect("Worker process exited unexpectedly");
+                        },
+                    }
+                },
+                // If a task is waiting, and we need to perform a snapshot, we do it with the
+                // highest prority.
+                Some(task) = self.task_receiver.recv(), if task_sender.is_some() => {
+                    // OK, we just checked that it is Some.
+                    let wait_notifier = task_sender.take().unwrap();
+                    wait_notifier.send(task);
+                },
+                Some((uuid, update, content, ret)) = self.update_receiver.recv(), if task_sender.is_some() => {
+                    match self.store.register_update(update, content, uuid) {
+                        Ok((global_id, enqueued)) => {
+                            self.update_queue.push_front(global_id);
+                            let _ = ret.send(Ok(enqueued));
+                            self.pending_update += 1;
+                        }
+                        Err(e) => {
+                            let _ = ret.send(Err(e.into()));
+                        }
+                    };
+                },
+                // There is a pending update to process and the worker is available, we can process
+                // it.
+                _ = futures::future::ready(()), if self.pending_update > 0 && task_sender.is_some() => {
+                    let wait_notifier = task_sender.take().unwrap();
+                    if let Some((index_uuid, processing)) = self.store.process_first().unwrap() {
+                        let task = Task::Update { processing, index_uuid };
+                        wait_notifier.send(task).expect("Fatal error: Update worker exited unexpectedly.");
+                        self.pending_update -= 1;
+                    }
+                },
+                else => break,
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum WorkerMsg {
+    Ready(oneshot::Sender<Task>),
+    Processed(UpdateStatus, oneshot::Sender<()>),
+}
+
+struct UpdateWorker<I> {
+    pub write_queue: mpsc::Sender<WorkerMsg>,
+    /// A list of deleted indexes to filter out from the update to process
+    pub path: PathBuf,
+    pub indexes: I,
+}
+
+impl<I: IndexActorHandle> UpdateWorker<I> {
+    pub fn new(path: impl AsRef<Path>, write_queue: mpsc::Sender<WorkerMsg>, indexes: I) -> Self {
+        let path = path.as_ref().to_owned();
+        Self {
+            write_queue,
+            path,
+            indexes,
+        }
+    }
+
+    /// Runs the UpdateWorker loop.
+    ///
+    /// The UpdateWorker job is to poll the WriteQueue for a task to accomplish. Whenever it is
+    /// available for work, it sends a message to the WriteQueue, and wait for it to respond with a
+    /// task.
+    async fn run(self) {
+        loop {
+            let (sender, receiver) = oneshot::channel();
+            self.write_queue.send(WorkerMsg::Ready(sender)).await.expect("Write queue exited.");
+            match receiver.await {
+                Ok(task) => {
+                    match task {
+                        Task::DeleteIndex { ret, uuid } => todo!(),
+                        Task::Update { processing, index_uuid } => self.perform_update(index_uuid, processing).await,
+                        Task::Snapshot => todo!(),
+                        Task::Dump => todo!(),
+                    };
+                },
+                // The receiver has been dropped, we try to poll the queue again.
+                Err(_) => (),
+            }
+        }
+    }
+
+    async fn perform_update(&self, uuid: Uuid, update: Processing) {
+        let content_path = update.from.content.map(|uuid| update_uuid_to_file_path(&self.path, uuid));
+        let update_id = update.id();
+
+        let file = match content_path {
+            Some(ref path) => {
+                let file = File::open(path).unwrap();
+                Some(file)
+            }
+            None => None,
+        };
+
+        // Process the pending update using the provided user function.
+        let result = match self.indexes.update(uuid, update.clone(), file).await {
+                Ok(result) => result,
+                Err(e) => Err(update.fail(e.into())),
+        };
+
+        // Once the pending update have been successfully processed
+        // we must remove the content from the pending and processing stores and
+        // write the *new* meta to the processed-meta store and commit.
+        let result = match result {
+            Ok(res) => res.into(),
+            Err(res) => res.into(),
+        };
+
+        // We send the result to the write loop to the result is recorded, and wait for
+        // acknowledgement before the worker can go into a ready state again.
+        let (sender, receiver) = oneshot::channel();
+        let msg = WorkerMsg::Processed(uuid, result, sender);
+        self.write_queue.send(msg).await.expect("write loop exited");
+
+        receiver.await.expect("write loop exited");
+    }
+}
+
 #[derive(Clone)]
-pub struct UpdateStore {
+pub struct UpdateStore<Mode> {
     pub env: Env,
     /// A queue containing the updates to process, ordered by arrival.
     /// The key are built as follow:
@@ -101,102 +272,245 @@ pub struct UpdateStore {
     /// The keys are built as follow:
     /// |    Uuid  |   id    |
     /// | 16-bytes | 8-bytes |
-    updates: Database<UpdateKeyCodec, SerdeJson<UpdateStatus>>,
-    /// Indicates the current state of the update store,
-    state: Arc<StateLock>,
-    /// Wake up the loop when a new event occurs.
-    notification_sender: mpsc::Sender<()>,
+    processed: Database<UpdateKeyCodec, SerdeJson<UpdateStatus>>,
+    /// Holds the currenlty processing update metadata.
+    processing: Database<Unit, SerdeJson<(Uuid, Processing)>>,
+    /// Path of the database.
     path: PathBuf,
+    mode: std::marker::PhantomData<Mode>,
 }
 
-impl UpdateStore {
+pub struct RO;
+pub struct RW;
+
+trait Readable {}
+trait Writable {}
+
+impl Readable for RO {}
+impl Readable for RW {}
+
+impl Writable for RW {}
+
+impl<T> UpdateStore<T> {
     fn new(
         mut options: EnvOpenOptions,
         path: impl AsRef<Path>,
-    ) -> anyhow::Result<(Self, mpsc::Receiver<()>)> {
-        options.max_dbs(5);
+    ) -> anyhow::Result<(UpdateStore<RW>, UpdateStore<RO>)> {
+        options.max_dbs(7);
 
         let env = options.open(&path)?;
         let pending_queue = env.create_database(Some("pending-queue"))?;
         let next_update_id = env.create_database(Some("next-update-id"))?;
-        let updates = env.create_database(Some("updates"))?;
-
-        let state = Arc::new(StateLock::from_state(State::Idle));
+        let updates = env.create_database(Some("processed"))?;
+        let processing = env.create_database(Some("processing"))?;
 
         let (notification_sender, notification_receiver) = mpsc::channel(1);
 
-        Ok((
-            Self {
+        let writer = Self {
                 env,
                 pending_queue,
                 next_update_id,
-                updates,
-                state,
-                notification_sender,
+                processed: updates,
+                processing,
                 path: path.as_ref().to_owned(),
-            },
-            notification_receiver,
-        ))
+                mode: std::marker::PhantomData,
+            };
+
+        let reader = writer.get_reader();
+
+        Ok((writer, reader))
+    }
+}
+
+impl<Mode: Readable> UpdateStore<Mode> {
+    async fn update_status(&self, status: UpdateStatus, global_id: UpdateId) -> Result<()> {
+        todo!()
+        //let store = self.store.clone();
+        //let path = self.path.clone();
+        //tokio::task::spawn_blocking(move || {
+            //// TODO: ignore when the enqueued update doesn't exist. (i.e: deleted index)
+            //let mut txn = store.env.write_txn()?;
+            //store.delete_pending(&mut txn, global_id)?;
+            //store.put_status(&mut txn, &status)?;
+            //txn.commit()?;
+            //// remove update file if it exists
+            //if let Some(content) = status.content() {
+                //// ignore error
+                //let path = update_uuid_to_file_path(&path, content);
+                //let _ = remove_file(path);
+            //}
+            //Ok(())
+        //}).await?
     }
 
-    pub fn open(
-        options: EnvOpenOptions,
-        path: impl AsRef<Path>,
-        index_handle: impl IndexActorHandle + Clone + Sync + Send + 'static,
-        must_exit: Arc<AtomicBool>,
-    ) -> anyhow::Result<Arc<Self>> {
-        let (update_store, mut notification_receiver) = Self::new(options, path)?;
-        let update_store = Arc::new(update_store);
+    /// List the updates for `index_uuid`.
+    pub fn list(&self, index_uuid: Uuid) -> Result<Vec<UpdateStatus>> {
+        let mut update_list = BTreeMap::<u64, UpdateStatus>::new();
 
-        // Send a first notification to trigger the process.
-        if let Err(TrySendError::Closed(())) = update_store.notification_sender.try_send(()) {
-            panic!("Failed to init update store");
+        let txn = self.env.read_txn()?;
+
+        let pendings = self.pending_queue.iter(&txn)?.lazily_decode_data();
+        for entry in pendings {
+            let ((_, uuid, id), pending) = entry?;
+            if uuid == index_uuid {
+                update_list.insert(id, pending.decode()?.into());
+            }
         }
 
-        // We need a weak reference so we can take ownership on the arc later when we
-        // want to close the index.
-        let duration = Duration::from_secs(10 * 60); // 10 minutes
-        let update_store_weak = Arc::downgrade(&update_store);
-        tokio::task::spawn(async move {
-            // Block and wait for something to process with a timeout. The timeout
-            // function returns a Result and we must just unlock the loop on Result.
-            'outer: while timeout(duration, notification_receiver.recv())
-                .await
-                .map_or(true, |o| o.is_some())
-            {
-                loop {
-                    match update_store_weak.upgrade() {
-                        Some(update_store) => {
-                            let handler = index_handle.clone();
-                            let res = tokio::task::spawn_blocking(move || {
-                                update_store.process_pending_update(handler)
-                            })
-                            .await
-                            .expect("Fatal error processing update.");
-                            match res {
-                                Ok(Some(_)) => (),
-                                Ok(None) => break,
-                                Err(e) => {
-                                    error!("Fatal error while processing an update that requires the update store to shutdown: {}", e);
-                                    must_exit.store(true, Ordering::SeqCst);
-                                    break 'outer;
-                                }
-                            }
-                        }
-                        // the ownership on the arc has been taken, we need to exit.
-                        None => break 'outer,
-                    }
-                }
+        let updates = self
+            .processed
+            .remap_key_type::<ByteSlice>()
+            .prefix_iter(&txn, index_uuid.as_bytes())?;
+
+        for entry in updates {
+            let (_, update) = entry?;
+            update_list.insert(update.id(), update);
+        }
+
+        // If the currently processing update is from this index, replace the corresponding pending update with this one.
+        match *self.state.read() {
+            Status::Processing(uuid, ref processing) if uuid == index_uuid => {
+                update_list.insert(processing.id(), processing.clone().into());
             }
+            _ => (),
+        }
 
-            error!("Update store loop exited.");
-        });
+        Ok(update_list.into_iter().map(|(_, v)| v).collect())
+    }
 
-        Ok(update_store)
+    /// Returns the update associated meta or `None` if the update doesn't exist.
+    pub fn meta(&self, index_uuid: Uuid, update_id: u64) -> heed::Result<Option<UpdateStatus>> {
+        // Check if the update is the one currently processing
+        match *self.state.read() {
+            Status::Processing(uuid, ref processing)
+                if uuid == index_uuid && processing.id() == update_id =>
+            {
+                return Ok(Some(processing.clone().into()));
+            }
+            _ => (),
+        }
+
+        let txn = self.env.read_txn()?;
+        // Else, check if it is in the updates database:
+        let update = self.processed.get(&txn, &(index_uuid, update_id))?;
+
+        if let Some(update) = update {
+            return Ok(Some(update));
+        }
+
+        // If nothing was found yet, we resolve to iterate over the pending queue.
+        let pendings = self.pending_queue.iter(&txn)?.lazily_decode_data();
+
+        for entry in pendings {
+            let ((_, uuid, id), pending) = entry?;
+            if uuid == index_uuid && id == update_id {
+                return Ok(Some(pending.decode()?.into()));
+            }
+        }
+
+        // No update was found.
+        Ok(None)
+    }
+
+    pub fn get_info(&self) -> Result<UpdateStoreInfo> {
+        let mut size = self.env.size();
+        let txn = self.env.read_txn()?;
+        for entry in self.pending_queue.iter(&txn)? {
+            let (_, pending) = entry?;
+            if let Enqueued {
+                content: Some(uuid),
+                ..
+            } = pending
+            {
+                let path = update_uuid_to_file_path(&self.path, uuid);
+                size += File::open(path)?.metadata()?.len();
+            }
+        }
+        let processing = match *self.state.read() {
+            Status::Processing(uuid, _) => Some(uuid),
+            _ => None,
+        };
+
+        Ok(UpdateStoreInfo { size, processing })
+    }
+
+}
+
+impl<Mode: Writable + Readable> UpdateStore<Mode> {
+    /// Gets a readable UpdateStore out of a writable UpdateStore.
+    fn get_reader(&self) -> UpdateStore<RO> {
+        UpdateStore {
+            env: self.env.clone(),
+            pending_queue: self.pending_queue.clone(),
+            next_update_id: self.next_update_id.clone(),
+            processed: self.processed.clone(),
+            processing: self.processing.clone(),
+            path: self.path.clone(),
+            mode: std::marker::PhantomData,
+        }
+    }
+
+    /// Moves the update from processing  to the processed store.
+    ///
+    /// Errors if there are no currently processing updates.
+    async fn process(&self, update: UpdateStatus) -> Result<()> {
+        let mut txn = self.env.write_txn()?;
+        let id = update.id();
+        // TODO: check that the processing update is the same as the one we are asked to process.
+        match self.processing.get(&txn, &())? {
+            Some((index_uuid, processing)) => {
+                debug_assert_eq!(processing.id(), update.id());
+                self.processing.delete(&mut txn, &())?;
+                self.processed.put(&mut txn, &(index_uuid, id), &update)?;
+                // Remove associated content if it exists.
+                if let Some(uuid) = update.content() {
+                    let path = update_uuid_to_file_path(&self.path, uuid);
+                    remove_file(path)?;
+                }
+
+                txn.commit()?;
+
+                Ok(())
+            }
+            None => todo!("No processing updates error"),
+        }
+    }
+
+    /// Turn the given global id into the current processing update. Fails if there is already a
+    /// processing update
+    fn process_first(&self) -> Result<Option<(Uuid, Processing)>> {
+        let mut txn = self.env.write_txn()?;
+
+        if self.processing.get(&txn, &())?.is_some() {
+            todo!("tryng to process an update while an update is still processing");
+        }
+
+        match self.pending_queue.first(&txn)? {
+            Some((key @ (_, uuid, _), update)) => {
+                let update = update.processing();
+                self.processing.put(&mut txn, &(), &(uuid, update))?;
+                self.pending_queue.delete(&mut txn, &key)?;
+                txn.commit()?;
+                Ok(Some((uuid, update)))
+            }
+            None => Ok(None)
+        }
+    }
+
+    fn delete_pending(&self, txn: &mut heed::RwTxn, id: UpdateId) -> Result<()> {
+        todo!()
+    }
+
+    fn put_status(&self, txn: &mut heed::RwTxn, status: &UpdateStatus) -> Result<()> {
+        todo!()
+    }
+
+    fn register_pending(&self, index_uuid: Uuid, update: Enqueued) -> Result<UpdateId> {
+        todo!()
     }
 
     /// Returns the next global update id and the next update id for a given `index_uuid`.
-    fn next_update_id(&self, txn: &mut heed::RwTxn, index_uuid: Uuid) -> heed::Result<(u64, u64)> {
+    fn next_update_id(&self, txn: &mut heed::RwTxn, index_uuid: Uuid) -> heed::Result<(GlobalUpdateId, UpdateId)> {
         let global_id = self
             .next_update_id
             .get(txn, &NextIdKey::Global)?
@@ -236,7 +550,7 @@ impl UpdateStore {
         meta: UpdateMeta,
         content: Option<Uuid>,
         index_uuid: Uuid,
-    ) -> heed::Result<Enqueued> {
+    ) -> heed::Result<(GlobalUpdateId, Enqueued)> {
         let mut txn = self.env.write_txn()?;
 
         let (global_id, update_id) = self.next_update_id(&mut txn, index_uuid)?;
@@ -251,7 +565,7 @@ impl UpdateStore {
             panic!("Update store loop exited");
         }
 
-        Ok(meta)
+        Ok((global_id, meta))
     }
 
     /// Push already processed update in the UpdateStore without triggering the notification
@@ -273,167 +587,17 @@ impl UpdateStore {
             }
             _ => {
                 let _update_id = self.next_update_id_raw(wtxn, index_uuid)?;
-                self.updates.put(wtxn, &(index_uuid, update.id()), update)?;
+                self.processed.put(wtxn, &(index_uuid, update.id()), update)?;
             }
         }
         Ok(())
-    }
-
-    /// Executes the user provided function on the next pending update (the one with the lowest id).
-    /// This is asynchronous as it let the user process the update with a read-only txn and
-    /// only writing the result meta to the processed-meta store *after* it has been processed.
-    fn process_pending_update(&self, index_handle: impl IndexActorHandle) -> Result<Option<()>> {
-        // Create a read transaction to be able to retrieve the pending update in order.
-        let rtxn = self.env.read_txn()?;
-        let first_meta = self.pending_queue.first(&rtxn)?;
-        drop(rtxn);
-
-        // If there is a pending update we process and only keep
-        // a reader while processing it, not a writer.
-        match first_meta {
-            Some(((global_id, index_uuid, _), mut pending)) => {
-                let content = pending.content.take();
-                let processing = pending.processing();
-                // Acquire the state lock and set the current state to processing.
-                // txn must *always* be acquired after state lock, or it will dead lock.
-                let state = self.state.write();
-                state.swap(State::Processing(index_uuid, processing.clone()));
-
-                let result =
-                    self.perform_update(content, processing, index_handle, index_uuid, global_id);
-
-                state.swap(State::Idle);
-
-                result
-            }
-            None => Ok(None),
-        }
-    }
-
-    fn perform_update(
-        &self,
-        content: Option<Uuid>,
-        processing: Processing,
-        index_handle: impl IndexActorHandle,
-        index_uuid: Uuid,
-        global_id: u64,
-    ) -> Result<Option<()>> {
-        let content_path = content.map(|uuid| update_uuid_to_file_path(&self.path, uuid));
-        let update_id = processing.id();
-
-        let file = match content_path {
-            Some(ref path) => {
-                let file = File::open(path)?;
-                Some(file)
-            }
-            None => None,
-        };
-
-        // Process the pending update using the provided user function.
-        let handle = Handle::current();
-        let result =
-            match handle.block_on(index_handle.update(index_uuid, processing.clone(), file)) {
-                Ok(result) => result,
-                Err(e) => Err(processing.fail(e.into())),
-            };
-
-        // Once the pending update have been successfully processed
-        // we must remove the content from the pending and processing stores and
-        // write the *new* meta to the processed-meta store and commit.
-        let mut wtxn = self.env.write_txn()?;
-        self.pending_queue
-            .delete(&mut wtxn, &(global_id, index_uuid, update_id))?;
-
-        let result = match result {
-            Ok(res) => res.into(),
-            Err(res) => res.into(),
-        };
-
-        self.updates
-            .put(&mut wtxn, &(index_uuid, update_id), &result)?;
-
-        wtxn.commit()?;
-
-        if let Some(ref path) = content_path {
-            remove_file(&path)?;
-        }
-
-        Ok(Some(()))
-    }
-
-    /// List the updates for `index_uuid`.
-    pub fn list(&self, index_uuid: Uuid) -> Result<Vec<UpdateStatus>> {
-        let mut update_list = BTreeMap::<u64, UpdateStatus>::new();
-
-        let txn = self.env.read_txn()?;
-
-        let pendings = self.pending_queue.iter(&txn)?.lazily_decode_data();
-        for entry in pendings {
-            let ((_, uuid, id), pending) = entry?;
-            if uuid == index_uuid {
-                update_list.insert(id, pending.decode()?.into());
-            }
-        }
-
-        let updates = self
-            .updates
-            .remap_key_type::<ByteSlice>()
-            .prefix_iter(&txn, index_uuid.as_bytes())?;
-
-        for entry in updates {
-            let (_, update) = entry?;
-            update_list.insert(update.id(), update);
-        }
-
-        // If the currently processing update is from this index, replace the corresponding pending update with this one.
-        match *self.state.read() {
-            State::Processing(uuid, ref processing) if uuid == index_uuid => {
-                update_list.insert(processing.id(), processing.clone().into());
-            }
-            _ => (),
-        }
-
-        Ok(update_list.into_iter().map(|(_, v)| v).collect())
-    }
-
-    /// Returns the update associated meta or `None` if the update doesn't exist.
-    pub fn meta(&self, index_uuid: Uuid, update_id: u64) -> heed::Result<Option<UpdateStatus>> {
-        // Check if the update is the one currently processing
-        match *self.state.read() {
-            State::Processing(uuid, ref processing)
-                if uuid == index_uuid && processing.id() == update_id =>
-            {
-                return Ok(Some(processing.clone().into()));
-            }
-            _ => (),
-        }
-
-        let txn = self.env.read_txn()?;
-        // Else, check if it is in the updates database:
-        let update = self.updates.get(&txn, &(index_uuid, update_id))?;
-
-        if let Some(update) = update {
-            return Ok(Some(update));
-        }
-
-        // If nothing was found yet, we resolve to iterate over the pending queue.
-        let pendings = self.pending_queue.iter(&txn)?.lazily_decode_data();
-
-        for entry in pendings {
-            let ((_, uuid, id), pending) = entry?;
-            if uuid == index_uuid && id == update_id {
-                return Ok(Some(pending.decode()?.into()));
-            }
-        }
-
-        // No update was found.
-        Ok(None)
     }
 
     /// Delete all updates for an index from the update store. If the currently processing update
     /// is for `index_uuid`, the call will block until the update is terminated.
     pub fn delete_all(&self, index_uuid: Uuid) -> Result<()> {
         let mut txn = self.env.write_txn()?;
+        let _lock = self.state.write();
         // Contains all the content file paths that we need to be removed if the deletion was successful.
         let mut uuids_to_remove = Vec::new();
 
@@ -457,7 +621,7 @@ impl UpdateStore {
         drop(pendings);
 
         let mut updates = self
-            .updates
+            .processed
             .remap_key_type::<ByteSlice>()
             .prefix_iter_mut(&mut txn, index_uuid.as_bytes())?
             .lazily_decode_data();
@@ -474,7 +638,7 @@ impl UpdateStore {
 
         // If the currently processing update is from our index, we wait until it is
         // finished before returning. This ensure that no write to the index occurs after we delete it.
-        if let State::Processing(uuid, _) = *self.state.read() {
+        if let Status::Processing(uuid, _) = *self.state.read() {
             if uuid == index_uuid {
                 // wait for a write lock, do nothing with it.
                 self.state.write();
@@ -501,7 +665,7 @@ impl UpdateStore {
         handle: impl IndexActorHandle + Clone,
     ) -> Result<()> {
         let state_lock = self.state.write();
-        state_lock.swap(State::Snapshoting);
+        state_lock.swap(Status::Snapshoting);
 
         let txn = self.env.write_txn()?;
 
@@ -550,28 +714,6 @@ impl UpdateStore {
         })?;
 
         Ok(())
-    }
-
-    pub fn get_info(&self) -> Result<UpdateStoreInfo> {
-        let mut size = self.env.size();
-        let txn = self.env.read_txn()?;
-        for entry in self.pending_queue.iter(&txn)? {
-            let (_, pending) = entry?;
-            if let Enqueued {
-                content: Some(uuid),
-                ..
-            } = pending
-            {
-                let path = update_uuid_to_file_path(&self.path, uuid);
-                size += File::open(path)?.metadata()?.len();
-            }
-        }
-        let processing = match *self.state.read() {
-            State::Processing(uuid, _) => Some(uuid),
-            _ => None,
-        };
-
-        Ok(UpdateStoreInfo { size, processing })
     }
 }
 
@@ -719,10 +861,10 @@ mod test {
         let txn = store.env.read_txn().unwrap();
 
         assert!(store.pending_queue.first(&txn).unwrap().is_none());
-        let update = store.updates.get(&txn, &(uuid, 0)).unwrap().unwrap();
+        let update = store.processed.get(&txn, &(uuid, 0)).unwrap().unwrap();
 
         assert!(matches!(update, UpdateStatus::Processed(_)));
-        let update = store.updates.get(&txn, &(uuid, 1)).unwrap().unwrap();
+        let update = store.processed.get(&txn, &(uuid, 1)).unwrap().unwrap();
 
         assert!(matches!(update, UpdateStatus::Failed(_)));
     }

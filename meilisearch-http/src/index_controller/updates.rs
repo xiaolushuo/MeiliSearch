@@ -200,6 +200,16 @@ impl UpdateStatus {
             _ => None,
         }
     }
+
+    pub fn content(&self) -> Option<Uuid> {
+        match self {
+            UpdateStatus::Processing(update) => update.from.content,
+            UpdateStatus::Enqueued(update) => update.content,
+            UpdateStatus::Processed(update) => update.from.from.content,
+            UpdateStatus::Aborted(update) => update.from.content,
+            UpdateStatus::Failed(update) => update.from.from.content,
+        }
+    }
 }
 
 impl From<Enqueued> for UpdateStatus {

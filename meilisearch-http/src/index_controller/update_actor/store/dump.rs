@@ -9,7 +9,7 @@ use heed::{EnvOpenOptions, RoTxn};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{Result, State, UpdateStore};
+use super::{Result, Status, UpdateStore};
 use crate::index_controller::{
     index_actor::IndexActorHandle, update_actor::store::update_uuid_to_file_path, Enqueued,
     UpdateStatus,
@@ -29,7 +29,7 @@ impl UpdateStore {
         handle: impl IndexActorHandle,
     ) -> Result<()> {
         let state_lock = self.state.write();
-        state_lock.swap(State::Dumping);
+        state_lock.swap(Status::Dumping);
 
         // txn must *always* be acquired after state lock, or it will dead lock.
         let txn = self.env.write_txn()?;
@@ -42,7 +42,7 @@ impl UpdateStore {
         let fut = dump_indexes(uuids, handle, &path);
         tokio::runtime::Handle::current().block_on(fut)?;
 
-        state_lock.swap(State::Idle);
+        state_lock.swap(Status::Idle);
 
         Ok(())
     }
@@ -104,7 +104,7 @@ impl UpdateStore {
         uuids: &HashSet<Uuid>,
         mut file: &mut File,
     ) -> Result<()> {
-        let updates = self.updates.iter(txn)?.lazily_decode_data();
+        let updates = self.processed.iter(txn)?.lazily_decode_data();
 
         for update in updates {
             let ((uuid, _), data) = update?;

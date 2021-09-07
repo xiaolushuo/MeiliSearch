@@ -14,13 +14,15 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::error::{Result, UpdateActorError};
-use super::{PayloadData, UpdateMsg, UpdateStore, UpdateStoreInfo};
+use super::{PayloadData, UpdateMsg, UpdateStoreInfo};
 use crate::index_controller::index_actor::IndexActorHandle;
 use crate::index_controller::{UpdateMeta, UpdateStatus};
+use super::store::{WriteQueue, RO, UpdateStore};
 
 pub struct UpdateActor<D, I> {
     path: PathBuf,
-    store: Arc<UpdateStore>,
+    /// Readonly access to the update store.
+    store: UpdateStore<RO>,
     inbox: Option<mpsc::Receiver<UpdateMsg<D>>>,
     index_handle: I,
     must_exit: Arc<AtomicBool>,
@@ -46,12 +48,17 @@ where
 
         let must_exit = Arc::new(AtomicBool::new(false));
 
-        let store = UpdateStore::open(options, &path, index_handle.clone(), must_exit.clone())?;
+        let (write_store, read_store) = UpdateStore::new(options, &path)?;
+
+        let task_sender
+        let write_queue = WriteQueue::new(write_store, task_receiver, update_receiver, indexes)
+
         std::fs::create_dir_all(path.join("update_files"))?;
+
         let inbox = Some(inbox);
         Ok(Self {
             path,
-            store,
+            store: read_store,
             inbox,
             index_handle,
             must_exit,

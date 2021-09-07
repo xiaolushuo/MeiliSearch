@@ -11,7 +11,7 @@ use error::Result;
 use message::UpdateMsg;
 
 pub use handle_impl::UpdateActorHandleImpl;
-pub use store::{UpdateStore, UpdateStoreInfo};
+pub use store::{UpdateStore, UpdateStoreInfo, RO};
 
 mod actor;
 pub mod error;

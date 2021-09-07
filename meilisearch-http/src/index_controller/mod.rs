@@ -6,7 +6,6 @@ use std::time::Duration;
 use actix_web::web::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::StreamExt;
-use log::error;
 use log::info;
 use milli::FieldDistribution;
 use serde::{Deserialize, Serialize};
@@ -265,10 +264,10 @@ impl IndexController {
         let index_handle = self.index_handle.clone();
         tokio::spawn(async move {
             if let Err(e) = update_handle.delete(uuid).await {
-                error!("Error while deleting index: {}", e);
+                println!("Error while deleting index update store: {}", e);
             }
             if let Err(e) = index_handle.delete(uuid).await {
-                error!("Error while deleting index: {}", e);
+                println!("Error while deleting index: {}", e);
             }
         });
 

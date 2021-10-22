@@ -42,8 +42,7 @@ impl ErrorCode for MilliError<'_> {
                     | UserError::NoSpaceLeftOnDevice
                     | UserError::DocumentLimitReached => Code::Internal,
                     UserError::AttributeLimitReached => Code::MaxFieldsLimitExceeded,
-                    UserError::InvalidFilter(_) => Code::Filter,
-                    UserError::InvalidFilterAttribute(_) => Code::Filter,
+                    UserError::InvalidFilter { .. } => Code::Filter,
                     UserError::MissingDocumentId { .. } => Code::MissingDocumentId,
                     UserError::MissingPrimaryKey => Code::MissingPrimaryKey,
                     UserError::PrimaryKeyCannotBeChanged => Code::PrimaryKeyAlreadyPresent,
@@ -55,6 +54,8 @@ impl ErrorCode for MilliError<'_> {
                     UserError::CriterionError(_) => Code::InvalidRankingRule,
                     UserError::InvalidGeoField { .. } => Code::InvalidGeoField,
                     UserError::SortError(_) => Code::Sort,
+                    // this should be removed with the next release. See https://github.com/meilisearch/milli/pull/399
+                    UserError::InvalidSortName { .. } => unreachable!(),
                 }
             }
         }

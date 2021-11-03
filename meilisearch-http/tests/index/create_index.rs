@@ -85,11 +85,10 @@ async fn error_create_existing_index() {
     });
 
     assert_eq!(response, expected_response);
-    assert_eq!(code, 409);
+    assert_eq!(code, 400);
 }
 
 #[actix_rt::test]
-#[ignore] // TODO: Fix in an other PR: uid returned `test%20test%23%21` instead of `test test#!`
 async fn error_create_with_invalid_index_uid() {
     let server = Server::new().await;
     let index = server.index("test test#!");

@@ -18,13 +18,13 @@ use uuid::Uuid;
 
 //use dump_actor::DumpActorHandle;
 //pub use dump_actor::{DumpInfo, DumpStatus};
-//use snapshot::load_snapshot;
+use snapshot::load_snapshot;
 
 use crate::document_formats::{read_csv, read_json, read_ndjson};
 use crate::index::{
     Checked, Document, IndexMeta, IndexStats, SearchQuery, SearchResult, Settings, Unchecked,
 };
-//use crate::index_controller::snapshot::SnapshotService;
+// use crate::index_controller::snapshot::SnapshotService;
 use crate::options::IndexerOpts;
 use crate::tasks::create_task_store;
 use crate::tasks::error::TaskError;
@@ -44,7 +44,7 @@ use crate::index_resolver::{create_index_resolver, IndexResolver, IndexUid};
 
 mod dump_actor;
 pub mod error;
-// mod snapshot;
+mod snapshot;
 pub mod update_file_store;
 // pub mod updates;
 
@@ -169,15 +169,16 @@ impl IndexControllerBuilder {
             .max_task_store_size
             .ok_or_else(|| anyhow::anyhow!("Missing update database size"))?;
 
-        //  if let Some(ref path) = self.import_snapshot {
-        //      info!("Loading from snapshot {:?}", path);
-        //      load_snapshot(
-        //          db_path.as_ref(),
-        //          path,
-        //          self.ignore_snapshot_if_db_exists,
-        //          self.ignore_missing_snapshot,
-        //      )?;
-        //  } else if let Some(ref src_path) = self.dump_src {
+        if let Some(ref path) = self.import_snapshot {
+            info!("Loading from snapshot {:?}", path);
+            load_snapshot(
+                db_path.as_ref(),
+                path,
+                self.ignore_snapshot_if_db_exists,
+                self.ignore_missing_snapshot,
+            )?;
+        }
+        //  else if let Some(ref src_path) = self.dump_src {
         //      load_dump(
         //          db_path.as_ref(),
         //          src_path,

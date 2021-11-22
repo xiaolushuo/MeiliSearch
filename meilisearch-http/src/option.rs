@@ -124,7 +124,7 @@ pub struct Opt {
     #[structopt(long, env = "MEILI_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
 
-    #[structopt(skip)]
+    #[structopt(flatten)]
     pub indexer_options: IndexerOpts,
 }
 

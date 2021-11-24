@@ -47,7 +47,7 @@ pub enum TaskEvent {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Task {
     pub id: TaskId,
     pub index_uid: IndexUid,

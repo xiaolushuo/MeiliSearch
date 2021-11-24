@@ -1,6 +1,6 @@
 mod store;
 
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -43,9 +43,41 @@ impl TaskFilter {
     }
 }
 
+#[derive(PartialEq, Eq)]
+enum GhostTask {
+    Dump {},
+    Snapshot {},
+    Task(Task),
+}
+
+#[derive(PartialEq, Eq)]
+pub enum PendingTask<T> {
+    // The id of a task to process
+    Real(T),
+    // A ghost task, without an id. Ghost tasks always have a higher priority over normal tasks
+    Ghost(GhostTask),
+}
+
+impl PartialOrd for PendingTask<TaskId> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        match (self, other) {
+            (PendingTask::Id(lhs), PendingTask::Id(rhs)) => Some(lhs.cmp(rhs)),
+            (PendingTask::Id(_), PendingTask::Ghost(_)) => Some(Ordering::Less),
+            (PendingTask::Ghost(_), PendingTask::Id(_)) => Some(Ordering::Greater),
+            (PendingTask::Ghost(_), PendingTask::Ghost(_)) => Some(Ordering::Equal),
+        }
+    }
+}
+
+impl Ord for PendingTask<TaskId> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap()
+    }
+}
+
 pub struct TaskStore {
     store: Arc<Store>,
-    pending_queue: Arc<RwLock<BinaryHeap<Reverse<TaskId>>>>,
+    pending_queue: Arc<RwLock<BinaryHeap<Reverse<PendingTask<TaskId>>>>>,
 }
 
 impl Clone for TaskStore {
@@ -97,7 +129,7 @@ impl TaskStore {
     }
 
     /// Returns the next task to process.
-    pub async fn peek_pending(&self) -> Option<TaskId> {
+    pub async fn peek_pending(&self) -> Option<PendingTask<TaskId>> {
         self.pending_queue.read().await.peek().map(|rid| rid.0)
     }
 

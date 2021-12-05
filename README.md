@@ -1,3 +1,6 @@
+一款开源免费、功能强大、快速、易于使用和部署的 #搜索引擎 MeiliSearch
+
+ (https://github.com/meilisearch/MeiliSearch)从搜索到展示结果速度达到小于 50 毫秒，可高度自由定制搜索与索引，能理解错字和拼写错误，支持中文字符、同义词等功能
 <p align="center">
   <img src="assets/logo.svg" alt="MeiliSearch" width="200" height="200" />
 </p>
